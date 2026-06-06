@@ -1,0 +1,62 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+*.env
+secrets.json
+credentials.json
+
+# Local data / indexes
+index/
+# 如果你希望保留样本数据，可以把这一行删掉
+# data/
+
+# Logs
+*.log
+logs/
+
+# Model / cache files
+.cache/
+.huggingface/
+.transformers/
+
+# Elasticsearch / Qdrant local dump files
+*.dump
+*.bak
+*.tmp
