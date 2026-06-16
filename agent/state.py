@@ -16,6 +16,7 @@ class AgentState(TypedDict):
 
     searched_queries: List[str]
     no_gain_rounds: int
+    max_no_gain_rounds: int
     planner_raw: str
     reflector_raw: str
     verifier_raw: str
@@ -28,3 +29,10 @@ class AgentState(TypedDict):
     retrieval_trace: List[Dict[str, Any]]
     source_filter: List[str]
     errors: List[str]
+
+    query_type: str
+    sub_questions: List[str]
+    sub_question_results: List[Dict[str, Any]]
+    retriever_status: Dict[str, Any]
+    degraded_mode: bool
+    chapter_candidates: List[str]

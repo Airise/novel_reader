@@ -5,18 +5,36 @@ from agent.nodes import (
     generator_node,
     planner_node,
     reflector_node,
+    router_node,
     verifier_node,
 )
 from agent.state import AgentState
 
 
+def _route_after_router(state: AgentState) -> str:
+    query_type = state.get("query_type", "fact")
+    return "planner" if query_type in {"fact", "search", "causal"} else "executor"
+
+
 def _route_after_planner(state: AgentState) -> str:
     action = (state.get("current_action") or {}).get("action")
-    return "executor" if action == "search" else "reflector"
+    if action == "search":
+        return "executor"
+    if (not state.get("should_continue", True)) or state.get("step_count", 0) >= state.get("max_steps", 4):
+        return "generator"
+    if state.get("no_gain_rounds", 0) >= state.get("max_no_gain_rounds", 2):
+        return "generator"
+    return "reflector"
 
 
 def _route_after_reflector(state: AgentState) -> str:
-    return "planner" if state.get("should_continue") else "generator"
+    if not state.get("should_continue"):
+        return "generator"
+    if state.get("no_gain_rounds", 0) >= state.get("max_no_gain_rounds", 2):
+        return "generator"
+    if state.get("step_count", 0) >= state.get("max_steps", 4):
+        return "generator"
+    return "planner"
 
 
 def _route_after_verifier(state: AgentState) -> str:
@@ -35,14 +53,16 @@ def _route_after_verifier(state: AgentState) -> str:
 def build_agent_graph():
     workflow = StateGraph(AgentState)
 
+    workflow.add_node("router", router_node)
     workflow.add_node("planner", planner_node)
     workflow.add_node("executor", executor_node)
     workflow.add_node("reflector", reflector_node)
     workflow.add_node("generator", generator_node)
     workflow.add_node("verifier", verifier_node)
 
-    workflow.set_entry_point("planner")
+    workflow.set_entry_point("router")
 
+    workflow.add_conditional_edges("router", _route_after_router)
     workflow.add_conditional_edges("planner", _route_after_planner)
     workflow.add_edge("executor", "reflector")
 

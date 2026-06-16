@@ -26,6 +26,8 @@ retriever = HybridRetriever()
 
 MAX_CONTEXTS_FOR_GENERATION = 12
 MAX_NO_GAIN_ROUNDS = 2
+MAX_SUB_QUESTIONS = 3
+
 
 def _load_prompt(path: str) -> PromptTemplate:
     with open(path, "r", encoding="utf-8") as f:
@@ -131,6 +133,80 @@ def _build_bridging_query(question: str, tag: str) -> str:
     bridge = bridge_map.get(tag, bridge_map["unclear"])
     return _compress_query(f"{core_text} {bridge}")
 
+
+def _classify_query_type(question: str) -> str:
+    q = (question or "").strip()
+    if not q:
+        return "fact"
+
+    contradiction_markers = ["是否矛盾", "矛盾", "冲突", "不一致", "前后是否一致", "前后是否冲突"]
+    comparison_markers = ["对比", "比较", "区别", "不同", "一致", "是否一致", "有哪些异同"]
+    tracing_markers = ["后来", "之后", "结局", "最终", "最后", "下场", "结果", "发展变化", "前后变化", "演变"]
+    causal_markers = ["为什么", "原因", "如何", "怎么", "怎样", "过程", "步骤", "策略", "手段", "办法", "计划", "通过什么", "如何实现"]
+    search_markers = ["找出", "列出", "所有", "哪些", "哪里", "在哪", "出处", "原文", "全文检索"]
+
+    if any(k in q for k in contradiction_markers):
+        return "contradiction"
+    if any(k in q for k in comparison_markers):
+        return "comparison"
+    if any(k in q for k in tracing_markers):
+        return "tracing"
+    if any(k in q for k in causal_markers):
+        return "causal"
+    if any(k in q for k in search_markers):
+        return "search"
+    return "fact"
+
+
+def _generate_sub_questions(question: str, query_type: str) -> List[str]:
+    q = (question or "").strip()
+    if query_type == "causal":
+        subs = [
+            f"{q} 的关键步骤",
+            f"{q} 依赖的关键人物或证据",
+            f"{q} 的结果和影响",
+        ]
+    elif query_type == "tracing":
+        subs = [
+            f"{q} 的关键时间线",
+            f"{q} 中涉及的主要人物关系变化",
+            f"{q} 的最终结果或结局",
+        ]
+    elif query_type == "contradiction":
+        subs = [
+            f"{q} 涉及的前后两处原文证据",
+            f"{q} 中是否存在人物、时间或设定冲突",
+            f"{q} 对应的章节或段落差异",
+        ]
+    elif query_type == "comparison":
+        subs = [
+            f"{q} 的两个对象各自描述",
+            f"{q} 的共同点与不同点",
+            f"{q} 的结论依据",
+        ]
+    else:
+        subs = [q]
+
+    cleaned = []
+    seen = set()
+    for item in subs:
+        item = _compress_query(item)
+        norm = _normalize_query(item)
+        if item and norm not in seen:
+            cleaned.append(item)
+            seen.add(norm)
+        if len(cleaned) >= MAX_SUB_QUESTIONS:
+            break
+    return cleaned
+
+
+def router_node(state: AgentState) -> AgentState:
+    state["query_type"] = _classify_query_type(state["question"])
+    state["sub_questions"] = _generate_sub_questions(state["question"], state["query_type"])
+    state["degraded_mode"] = False
+    return state
+
+
 def planner_node(state: AgentState) -> AgentState:
     """规划下一步：search / refine"""
     t0 = time.perf_counter()
@@ -196,6 +272,7 @@ def planner_node(state: AgentState) -> AgentState:
         if normalized in normalized_history:
             state["steps"].append(f"规划: 检测到重复查询（归一化后），跳过（{query}）")
             action = {"action": "refine"}
+            state["no_gain_rounds"] = state.get("no_gain_rounds", 0) + 1
         else:
             state["searched_queries"].append(query)
 
@@ -208,52 +285,76 @@ def executor_node(state: AgentState) -> AgentState:
     """执行检索并更新状态"""
     t0 = time.perf_counter()
     action: Dict = state.get("current_action") or {}
-    if action.get("action") != "search":
-        state["node_timings_ms"]["executor"].append(round((time.perf_counter() - t0) * 1000, 2))
-        return state
 
-    query = (action.get("query") or "").strip()
-    if not query:
+    queries: List[str] = []
+    if action.get("action") == "search" and (action.get("query") or "").strip():
+        queries.append((action.get("query") or "").strip())
+
+    query_type = state.get("query_type")
+    if query_type in {"tracing", "comparison", "contradiction", "causal"}:
+        for sub_q in state.get("sub_questions") or []:
+            sub_q = (sub_q or "").strip()
+            if sub_q:
+                queries.append(sub_q)
+
+    queries = _dedup_contexts(queries)
+    if not queries and state.get("question"):
+        queries = [state["question"].strip()]
+
+    if not queries:
         state["steps"].append("搜索: 空查询，跳过")
+        state["node_timings_ms"]["executor"].append(round((time.perf_counter() - t0) * 1000, 2))
         return state
 
     source_filter = state.get("source_filter") or []
+    retrieval_items = []
+    collected_chapters = []
 
-    try:
-        new_contexts = retriever.retrieve(query, source_filter=source_filter)
-    except Exception as e:
-        msg = f"搜索失败: {query} ({e})"
-        state["steps"].append(msg)
-        state["errors"].append(msg)
-        state["retrieval_trace"].append(
-            {"query": query, "retrieved": 0, "added": 0, "error": str(e)}
+    for q in queries[:MAX_SUB_QUESTIONS]:
+        try:
+            docs = retriever.retrieve_with_details(q, source_filter=source_filter)
+            new_contexts = [doc.get("text", "") for doc in docs if doc.get("text")]
+        except Exception as e:
+            msg = f"搜索失败: {q} ({e})"
+            state["steps"].append(msg)
+            state["errors"].append(msg)
+            retrieval_items.append({"query": q, "retrieved": 0, "added": 0, "error": str(e), "query_type": state.get("query_type")})
+            state["no_gain_rounds"] += 1
+            continue
+
+        before = len(state["contexts"])
+        state["contexts"] = _dedup_contexts(state["contexts"] + new_contexts)
+        added = len(state["contexts"]) - before
+
+        retrieval_items.append(
+            {
+                "query": q,
+                "source_filter": source_filter,
+                "retrieved": len(new_contexts),
+                "added": added,
+                "error": None,
+                "query_type": state.get("query_type"),
+            }
         )
+
+        for doc in docs:
+            chap = doc.get("chapter_id")
+            if chap is not None:
+                collected_chapters.append(str(chap))
+
+        if added == 0:
+            state["no_gain_rounds"] += 1
+        else:
+            state["no_gain_rounds"] = 0
+
+        state["steps"].append(f"搜索: {q} (新增片段 {added})")
         state["step_count"] += 1
-        state["no_gain_rounds"] += 1
-        state["node_timings_ms"]["executor"].append(round((time.perf_counter() - t0) * 1000, 2))
-        return state
 
-    before = len(state["contexts"])
-    state["contexts"] = _dedup_contexts(state["contexts"] + new_contexts)
-    added = len(state["contexts"]) - before
+    state["retrieval_trace"].extend(retrieval_items)
+    state["sub_question_results"] = retrieval_items
+    state["degraded_mode"] = bool((not getattr(retriever, "qdrant_healthy", True)) or (not getattr(retriever, "es_healthy", True)))
+    state["chapter_candidates"] = _dedup_contexts(collected_chapters)
 
-    state["retrieval_trace"].append(
-        {
-            "query": query,
-            "source_filter": source_filter,
-            "retrieved": len(new_contexts),
-            "added": added,
-            "error": None,
-        }
-    )
-
-    if added == 0:
-        state["no_gain_rounds"] += 1
-    else:
-        state["no_gain_rounds"] = 0
-
-    state["steps"].append(f"搜索: {query} (新增片段 {added})")
-    state["step_count"] += 1
     state["node_timings_ms"]["executor"].append(round((time.perf_counter() - t0) * 1000, 2))
     return state
 
@@ -267,7 +368,8 @@ def reflector_node(state: AgentState) -> AgentState:
         state["node_timings_ms"]["reflector"].append(round((time.perf_counter() - t0) * 1000, 2))
         return state
 
-    if state["no_gain_rounds"] >= MAX_NO_GAIN_ROUNDS:
+    max_no_gain_rounds = state.get("max_no_gain_rounds", MAX_NO_GAIN_ROUNDS)
+    if state["no_gain_rounds"] >= max_no_gain_rounds:
         state["should_continue"] = False
         state["steps"].append("反思: 连续低增益检索，提前停止")
         state["node_timings_ms"]["reflector"].append(round((time.perf_counter() - t0) * 1000, 2))
@@ -302,7 +404,7 @@ def reflector_node(state: AgentState) -> AgentState:
 
 
 def generator_node(state: AgentState) -> AgentState:
-    """最终答案生成（泛化版：先抽取事实，再推导结论）。"""
+    """最终答案生成（按问题类型自适应输出）。"""
     t0 = time.perf_counter()
     if not state["contexts"]:
         state["answer"] = "未找到相关信息。"
@@ -312,26 +414,60 @@ def generator_node(state: AgentState) -> AgentState:
     selected_contexts = state["contexts"][-MAX_CONTEXTS_FOR_GENERATION:]
     contexts_str = "\n\n".join(selected_contexts)
     question = state["question"]
+    query_type = state.get("query_type", "fact")
+    sub_questions = state.get("sub_questions") or []
+    degraded_mode = state.get("degraded_mode", False)
 
-    prompt = f"""你是一个严谨的中文小说问答助手。
-请只基于给定信息回答问题；若信息不足，明确回答“我不知道”。
-
-问题：{question}
-
-信息：
-{contexts_str}
-
-请按“先事实、后推理、再结论”的方式作答，并严格输出以下结构：
+    if query_type == "tracing":
+        format_hint = """请按以下格式输出：
+1) 时间线（按先后顺序列出 2-5 条）
+2) 关键人物变化
+3) 最终结局/状态
+4) 结论（若证据不足，请明确说明）"""
+    elif query_type == "contradiction":
+        format_hint = """请按以下格式输出：
+1) 证据A
+2) 证据B
+3) 是否矛盾（是/否/无法判断）
+4) 矛盾点说明
+5) 结论"""
+    elif query_type == "comparison":
+        format_hint = """请按以下格式输出：
+1) 对象A
+2) 对象B
+3) 相同点
+4) 不同点
+5) 结论"""
+    else:
+        format_hint = """请按“先事实、后推理、再结论”的方式作答，并严格输出以下结构：
 1) 关键事实（1-4条）：每条必须是可直接从信息中抽取的事实，包含实体与关系/事件，并在末尾附上原文短引（8-20字）。
 2) 推理链：说明你如何由关键事实推出结论（若无法推出，明确缺少哪条事实）。
 3) 结论类型：从【确定 / 倾向 / 信息不足】中选一项。
 4) 简洁答案：一句话。
 5) 关键依据：列出支撑结论的 1-3 条证据（必须与上文短引一致）。
-6) 若证据冲突，请单独指出冲突点。
+6) 若证据冲突，请单独指出冲突点。"""
+
+    subq_text = "\n".join(f"- {q}" for q in sub_questions) if sub_questions else "暂无"
+    degraded_hint = "当前处于检索降级模式，请更谨慎作答并明确标注不确定性。" if degraded_mode else ""
+
+    prompt = f"""你是一个严谨的中文小说问答与审校助手。
+请只基于给定信息回答问题；若信息不足，明确回答“我不知道”。
+{degraded_hint}
+
+问题：{question}
+问题类型：{query_type}
+子问题：
+{subq_text}
+
+信息：
+{contexts_str}
+
+{format_hint}
 
 硬性要求：
 - 不得引入信息中未出现的人物、事件或设定。
-- 若找不到可引用的原文短引，必须输出“信息不足”。"""
+- 若找不到可引用的原文短引，必须输出“信息不足”。
+- 如果子问题检索结果之间存在冲突，请明确指出冲突来源。"""
 
     response = llm.invoke(prompt)
     state["answer"] = (response.content or "").strip()
@@ -371,6 +507,7 @@ def verifier_node(state: AgentState) -> AgentState:
     answer = (state.get("answer") or "").strip()
     contexts = state.get("contexts") or []
     question = state.get("question") or ""
+    query_type = state.get("query_type", "fact")
 
     if not answer:
         state["verify_pass"] = False
@@ -384,15 +521,28 @@ def verifier_node(state: AgentState) -> AgentState:
 
     contexts_str = "\n\n".join(contexts[-10:]) if contexts else "暂无"
 
+    if query_type == "tracing":
+        rule_hint = "重点检查时间线是否前后连贯、是否遗漏关键节点。"
+    elif query_type == "contradiction":
+        rule_hint = "重点检查答案是否准确指出证据冲突，避免把无冲突判成冲突。"
+    elif query_type == "comparison":
+        rule_hint = "重点检查对比项是否完整、是否混淆比较对象。"
+    else:
+        rule_hint = "重点检查事实一致性、推理完整性与结论审慎性。"
+
     prompt = f"""你是严格的答案校验器。请判断答案是否被给定信息支持。
 
 问题：{question}
+问题类型：{query_type}
 
 候选答案：
 {answer}
 
 证据信息：
 {contexts_str}
+
+校验重点：
+{rule_hint}
 
 判定规则（通用）：
 1) 事实一致性：答案中的关键事实是否能在证据中找到支撑。

@@ -29,10 +29,13 @@ RERANK_TOP_K = 5       # 最终返回数量
 RERANK_MIN_SCORE = 0.15  # rerank 最小相关性阈值（低于则丢弃）
 
 # 预处理参数（实验B）
+ENABLE_INCREMENTAL_INDEXING = True  # 是否启用章节级增量索引
+CHAPTER_SPLIT_REGEX = r"(?m)^(?:\s*)(?:序章|楔子|尾声|第[一二三四五六七八九十百千万0-9]+[卷部篇章节回](?:\s*.*)?)\s*$"
 CHUNK_MAX_CHARS = 280       # 单 chunk 最大字符数
 CHUNK_OVERLAP_CHARS = 100   # 长段滑窗重叠字符数
 CHUNK_MIN_CHARS = 80        # 过短段落拼接阈值
 TARGET_CHARS = 200          # 段落拼接目标长度
+CHUNK_HASH_ALGO = "md5"     # chunk / chapter 哈希算法
 
 # 中文嵌入模型
 EMBEDDING_MODEL = "BAAI/bge-large-zh"

@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from typing import List
 
 import jieba
 from elasticsearch import Elasticsearch, helpers
@@ -10,6 +11,14 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from utils.config import ES_ANALYZER, ES_HOST, ES_INDEX, INDEX_DIR
+
+
+def _load_chunks() -> List[dict]:
+    with open(os.path.join(INDEX_DIR, "novel_chunks.json"), "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    if not isinstance(chunks, list):
+        raise RuntimeError("novel_chunks.json 格式错误，应该是列表")
+    return chunks
 
 
 def build_bm25_index():
@@ -23,7 +32,6 @@ def build_bm25_index():
     if es.indices.exists(index=ES_INDEX):
         es.indices.delete(index=ES_INDEX)
 
-    # 创建索引：text 为原文，text_jieba 为 jieba 预分词后的空格串
     es.indices.create(
         index=ES_INDEX,
         body={
@@ -35,6 +43,10 @@ def build_bm25_index():
                 "properties": {
                     "uid": {"type": "keyword"},
                     "source": {"type": "keyword"},
+                    "chapter_id": {"type": "integer"},
+                    "chapter_title": {"type": "keyword"},
+                    "chapter_hash": {"type": "keyword"},
+                    "chunk_hash": {"type": "keyword"},
                     "text": {"type": "text", "index": False},
                     "text_jieba": {
                         "type": "text",
@@ -47,21 +59,25 @@ def build_bm25_index():
     )
     print(f"创建索引 {ES_INDEX}，使用 jieba + {ES_ANALYZER} 分词")
 
-    # 加载 chunks
-    with open(os.path.join(INDEX_DIR, "novel_chunks.json"), "r", encoding="utf-8") as f:
-        chunks = json.load(f)
+    chunks = _load_chunks()
 
     actions = []
     for item in tqdm(chunks, desc="索引文档"):
-        text = item["text"]
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
         text_jieba = " ".join(jieba.cut_for_search(text))
         actions.append(
             {
                 "_index": ES_INDEX,
-                "_id": item["id"],
+                "_id": int(item["id"]),
                 "_source": {
                     "uid": item.get("uid", ""),
                     "source": item.get("source", ""),
+                    "chapter_id": int(item.get("chapter_id", 0) or 0),
+                    "chapter_title": item.get("chapter_title", ""),
+                    "chapter_hash": item.get("chapter_hash", ""),
+                    "chunk_hash": item.get("chunk_hash", ""),
                     "text": text,
                     "text_jieba": text_jieba,
                 },

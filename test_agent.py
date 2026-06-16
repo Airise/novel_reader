@@ -32,6 +32,7 @@ def run_agent(
         "should_continue": True,
         "searched_queries": [],
         "no_gain_rounds": 0,
+        "max_no_gain_rounds": 2,
         "planner_raw": "",
         "reflector_raw": "",
         "verifier_raw": "",
@@ -51,7 +52,7 @@ def run_agent(
         "source_filter": source_filter or [],
         "errors": [],
     }
-    final_state = graph.invoke(initial_state, config={"recursion_limit": 60})
+    final_state = graph.invoke(initial_state, config={"recursion_limit": 120})
     return final_state
 
 

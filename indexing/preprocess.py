@@ -1,13 +1,15 @@
+import hashlib
 import json
 import os
 import re
 import sys
-from typing import List
+from typing import Dict, List
 
 # 允许以 `python indexing/preprocess.py` 方式直接运行
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from utils.config import (
+    CHUNK_HASH_ALGO,
     CHUNK_MAX_CHARS,
     CHUNK_MIN_CHARS,
     CHUNK_OVERLAP_CHARS,
@@ -37,11 +39,12 @@ def load_txt():
 
 
 def normalize_text(text: str) -> str:
-    """归一化换行与空白字符"""
+    """归一化换行与空白字符。"""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u3000", " ")
     text = re.sub(r"[\t\f\v]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ ]{2,}", " ", text)
     return text.strip()
 
 
@@ -57,6 +60,108 @@ def split_by_sentence(text: str) -> List[str]:
             sent += parts[i + 1]
         sentences.append(sent)
     return sentences
+
+
+def stable_hash(text: str) -> str:
+    algo = hashlib.new(CHUNK_HASH_ALGO)
+    algo.update(text.encode("utf-8"))
+    return algo.hexdigest()
+
+
+def split_by_chapter(text: str) -> List[Dict[str, str]]:
+    """按卷/章等标题切分，返回章节列表。"""
+    lines = text.split("\n")
+
+    title_pattern = re.compile(
+        r"^\s*(序章|楔子|尾声|第[一二三四五六七八九十百千万0-9]+[卷部篇章节回](?:\s*.*)?)\s*$"
+    )
+    title_like_pattern = re.compile(r"^\s*第[一二三四五六七八九十百千万0-9]+[卷部篇章节回]\s*.*$")
+    standalone_title_pattern = re.compile(r"^\s*(序章|楔子|尾声)\s*$")
+
+    chapters = []
+    current_volume = ""
+    current_chapter = ""
+    current_lines = []
+    volume_idx = 0
+    chapter_idx = 0
+
+    def flush():
+        nonlocal current_volume, current_chapter, current_lines
+        body = "\n".join(current_lines).strip()
+        if not body and not current_volume and not current_chapter:
+            return
+
+        title_parts = [p for p in [current_volume, current_chapter] if p]
+        title = " ".join(title_parts).strip() or f"第{len(chapters) + 1}章"
+        chapters.append(
+            {
+                "chapter_id": len(chapters) + 1,
+                "chapter_title": title,
+                "chapter_text": f"{title}\n{body}".strip() if body else title,
+            }
+        )
+        current_lines = []
+
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            current_lines.append("")
+            continue
+
+        if standalone_title_pattern.match(raw):
+            if current_volume or current_chapter or current_lines:
+                flush()
+            chapter_idx += 1
+            current_volume = ""
+            current_chapter = raw
+            continue
+
+        if title_like_pattern.match(raw):
+            if current_volume or current_chapter or current_lines:
+                flush()
+            if "卷" in raw and not re.search(r"[章节回部篇]", raw):
+                volume_idx += 1
+                current_volume = raw
+                current_chapter = ""
+            elif "卷" in raw and re.search(r"[章节回部篇]", raw):
+                volume_idx += 1
+                current_volume = raw
+                current_chapter = ""
+            else:
+                if "卷" not in raw and volume_idx:
+                    current_chapter = raw
+                else:
+                    chapter_idx += 1
+                    current_chapter = raw
+            continue
+
+        if title_pattern.match(raw):
+            if current_volume or current_chapter or current_lines:
+                flush()
+            if "卷" in raw and not re.search(r"[章节回部篇]", raw):
+                volume_idx += 1
+                current_volume = raw
+                current_chapter = ""
+            else:
+                chapter_idx += 1
+                current_chapter = raw
+            continue
+
+        current_lines.append(raw)
+
+    if current_volume or current_chapter or current_lines:
+        flush()
+
+    if not chapters:
+        return [
+            {
+                "chapter_id": 1,
+                "chapter_title": "全文",
+                "chapter_text": text.strip(),
+            }
+        ]
+
+    return chapters
 
 
 def find_best_cut(text: str, start: int, max_chars: int) -> int:
@@ -133,46 +238,42 @@ def chunk_text(text: str) -> List[str]:
 
     final_chunks = []
     for p in merged_paragraphs:
+        paragraph_chunks = []
         if len(p) <= CHUNK_MAX_CHARS:
-            final_chunks.append(p)
-            continue
-
-        # 超长段先切句再拼块，保持语义边界
-        sentences = split_by_sentence(p)
-        if not sentences:
-            final_chunks.extend(
-                split_long_text(
+            paragraph_chunks = [p]
+        else:
+            # 超长段先切句再拼块，保持语义边界
+            sentences = split_by_sentence(p)
+            if not sentences:
+                paragraph_chunks = split_long_text(
                     p, max_chars=CHUNK_MAX_CHARS, overlap=CHUNK_OVERLAP_CHARS
                 )
-            )
-            continue
-
-        buf = ""
-        for s in sentences:
-            if len(buf) + len(s) <= CHUNK_MAX_CHARS:
-                buf += s
             else:
+                buf = ""
+                for s in sentences:
+                    if len(buf) + len(s) <= CHUNK_MAX_CHARS:
+                        buf += s
+                    else:
+                        if buf:
+                            paragraph_chunks.append(buf.strip())
+                        buf = s
+
                 if buf:
-                    final_chunks.append(buf.strip())
-                buf = s
+                    paragraph_chunks.append(buf.strip())
 
-        if buf:
-            final_chunks.append(buf.strip())
+                refined = []
+                for c in paragraph_chunks:
+                    if len(c) > CHUNK_MAX_CHARS:
+                        refined.extend(
+                            split_long_text(
+                                c, max_chars=CHUNK_MAX_CHARS, overlap=CHUNK_OVERLAP_CHARS
+                            )
+                        )
+                    else:
+                        refined.append(c)
+                paragraph_chunks = refined
 
-        # 兜底：如果仍有超长 chunk，则走断点优先滑窗切
-        refined = []
-        for c in final_chunks:
-            if len(c) > CHUNK_MAX_CHARS:
-                refined.extend(
-                    split_long_text(
-                        c, max_chars=CHUNK_MAX_CHARS, overlap=CHUNK_OVERLAP_CHARS
-                    )
-                )
-            else:
-                refined.append(c)
-        final_chunks = refined
-
-    final_chunks = [c for c in final_chunks if c.strip()]
+        final_chunks.extend([c for c in paragraph_chunks if c.strip()])
 
     # 末尾回并：最后一个 chunk 过短时，合并到前一个 chunk
     if len(final_chunks) >= 2 and len(final_chunks[-1]) < CHUNK_MIN_CHARS:
@@ -182,6 +283,54 @@ def chunk_text(text: str) -> List[str]:
             final_chunks.pop()
 
     return final_chunks
+
+
+def build_structured_chunks(text: str) -> List[Dict[str, str]]:
+    """按章节生成结构化 chunk，便于增量更新。"""
+    chapters = split_by_chapter(text)
+    structured = []
+    chunk_id = 0
+
+    for chapter in chapters:
+        chapter_id = chapter["chapter_id"]
+        chapter_title = chapter["chapter_title"]
+        chapter_text = normalize_text(chapter["chapter_text"])
+        chapter_hash = stable_hash(chapter_text)
+        chunks = chunk_text(chapter_text)
+
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            chunk_clean = chunk.strip()
+            if not chunk_clean:
+                continue
+            chunk_id += 1
+            structured.append(
+                {
+                    "id": chunk_id - 1,
+                    "uid": stable_hash(f"{chapter_id}::{chunk_idx}::{chunk_clean}"),
+                    "text": chunk_clean,
+                    "chapter_id": chapter_id,
+                    "chapter_title": chapter_title,
+                    "chapter_hash": chapter_hash,
+                    "chunk_hash": stable_hash(chunk_clean),
+                }
+            )
+
+    return structured
+
+
+def build_chapter_hashes(chapters: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """生成章节 hash 清单。"""
+    result = []
+    for chapter in chapters:
+        chapter_text = normalize_text(chapter["chapter_text"])
+        result.append(
+            {
+                "chapter_id": chapter["chapter_id"],
+                "chapter_title": chapter["chapter_title"],
+                "chapter_hash": stable_hash(chapter_text),
+            }
+        )
+    return result
 
 
 def build_quality_report(chunks: List[str]):
@@ -257,19 +406,26 @@ def build_quality_report(chunks: List[str]):
 
 def main():
     text = normalize_text(load_txt())
-    chunks = chunk_text(text)
-    chunk_data = [{"id": i, "text": chunk} for i, chunk in enumerate(chunks)]
+    chapters = split_by_chapter(text)
+    structured_chunks = build_structured_chunks(text)
+    chunk_texts = [item["text"] for item in structured_chunks]
 
     output_path = os.path.join(INDEX_DIR, "novel_chunks.json")
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(chunk_data, f, ensure_ascii=False, indent=2)
+        json.dump(structured_chunks, f, ensure_ascii=False, indent=2)
 
-    report = build_quality_report(chunks)
+    chapter_hashes = build_chapter_hashes(chapters)
+    chapter_hashes_path = os.path.join(INDEX_DIR, "chapter_hashes.json")
+    with open(chapter_hashes_path, "w", encoding="utf-8") as f:
+        json.dump(chapter_hashes, f, ensure_ascii=False, indent=2)
+
+    report = build_quality_report(chunk_texts)
     report_path = os.path.join(INDEX_DIR, "chunk_quality_report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    print(f"共切分 {len(chunk_data)} 个文本块，保存至 {output_path}")
+    print(f"共切分 {len(structured_chunks)} 个文本块，保存至 {output_path}")
+    print(f"章节 hash 已保存至 {chapter_hashes_path}")
     print(f"切分质量报告已保存至 {report_path}")
 
 
