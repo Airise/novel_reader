@@ -222,8 +222,8 @@ def get_available_sources() -> List[str]:
     return [s for s in sources if s]
 
 
-st.title("Week2 Agentic RAG 对话")
-st.caption("已接入 Week2 Agent 后端；支持文件上传并手动触发处理")
+st.title("NovelQuest Agentic RAG 对话")
+st.caption("已接入 NovelQuest Agentic 后端；支持文件上传并手动触发处理")
 
 with st.sidebar:
     st.subheader("运行设置")

@@ -1,4 +1,4 @@
-# Week2 Agentic RAG（中文小说问答 / 审校助手）
+# NovelQuest Agentic RAG（中文小说问答 / 审校助手）
 
 一个基于 **LangGraph + 混合检索（Qdrant 向量 + Elasticsearch BM25）+ Reranker** 的中文长文本问答项目，面向中文小说、剧情追踪与编辑审校场景。
 
